@@ -26,3 +26,6 @@ The code development has taken a new path that follows this:
 4. Set up Relay communication (will likely have to be tweaked later on when relay is properly set up)
 5. Build schedule class logic and ML
 6. Write a clock logic since the pico's RTC is not reliable enough for this
+7. Combine everything into a main function
+8. Test with mock data
+9. Translate it into C (if time allows)

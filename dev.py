@@ -142,6 +142,36 @@ class Scheduler:
 
     def should_be_on(self, slot):
         return self.active[slot]
+    
+    def maybe_update(self):
+        if not self.locked:
+            return
+        for i in range(SCHEDULE_SLOTS):
+            self.slot[i][0] = self.slot[i][0] * 0.75
+            self.slot[i][1] = self.slot[i][1] * 0.75
+        self.build()
+    
+    def save(self):
+        data = {
+            "votes": self.slot,
+            "active": self.active,
+            "days_recorded": self.days_recorded,
+            "locked": self.locked
+        }
+        with open(STATE_FILE, "w") as f:
+            ujson.dump(data, f)
+
+    def load(self):
+        try:
+            with open(SCHEDULE_FILE, "r") as f:
+                data = ujson.load(f)
+            self.slot_votes = data["votes"]
+            self.active = data["active"]
+            self.days_recorded = data["days_recorded"]
+            self.locked = data["locked"]
+            print (f"[SCHEDULER] Loaded schedule with {self.days_recorded} days recorded, locked: {self.locked}")
+        except Exception as e:
+            print(f"[SCHEDULER] No previous schedule found, starting fresh. Error:")
 
 # We will have to "code" our own clock since the RTC module is only reliable if connected to wifi.
 class Clock:
@@ -161,3 +191,91 @@ class Clock:
     def slot(self):
         minutes = (self.elapased // 60) % (24 * 60) # Get minutes in the current cycle
         return minutes // 30 # Each slot is 30 minutes
+    
+    @property
+    def day(self):
+        return self.elapased // (24 * 60 * 60)
+    
+    def save(self):
+        with open(STATE_FILE, "w") as f:
+            ujson.dump({"elapsed": self.elapased}, f)
+
+    def _load(self):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = ujson.load(f)
+                self.elapased = data.get("elapsed", 0)
+                print(f"[CLOCK] Loaded elapsed time: {self.elapased} seconds")
+        except Exception as e:
+            print(f"[CLOCK] No previous state found, starting fresh. Error: {e}")
+
+# Main loop starts HERE
+def main():
+    # Init hardware
+    i2c = machine.I2C(
+        I2C_ID, 
+        scl=machine.Pin(I2C_SCL_PIN), 
+        sda=machine.Pin(I2C_SDA_PIN), 
+        freq=I2C_FREQ
+    )
+    ina219 = INA219(i2c)
+    relay = Relay(RELAY_PIN)
+
+    # Init states
+    scheduler = Scheduler()
+    clock = Clock()
+    scheduler.load()
+
+    last_sample = clock.elapased
+    last_save = clock.elapased
+    last_day = clock.day
+
+    phase = "LOCKED" if scheduler.locked else "LEARNING"
+    print(f"[SYSTEM] Starting in {phase} phase.")
+
+    while True:
+        clock.sample()
+        now_seconds = clock.elapased
+
+        if (now_seconds - last_sample) >= SAMPLE_INTERVAL:
+            last_sample = now_seconds
+            try:
+                voltage, current, power = ina219.read()
+                is_on = power >= ON_THRESHOLD
+                slot = clock.slot
+
+                print(f"[SAMPLE] Day {clock.day:.2f}, Slot {clock.slot}, Power: {power:.2f}W, Relay: {'ON' if is_on else 'OFF'}")
+
+                scheduler.record_sample(slot, is_on)
+
+                if scheduler.locked:
+                    relay.set(scheduler.should_be_on(slot))
+                else:
+                    relay.on
+            
+            except Exception as e:
+                print(f"[ERROR] Failed to read sensor or update relay: {e}")
+
+        current_day = clock.day
+        if current_day != last_day:
+            last_day = current_day
+
+            if not scheduler.locked:
+                scheduler.mark_day_complete()
+            elif current_day % 3 == 0:
+                scheduler.maybe_update()
+
+        if (now_seconds - last_save) >= SAVE_TO_FLASH:
+            last_save = now_seconds
+            try:
+                clock.save()
+                scheduler.save()
+                print("[SYSTEM] State saved to flash.")
+            except Exception as e:
+                print(f"[ERROR] Failed to save state: {e}")
+
+        utime.sleep(1)
+
+if __name__ == "__main__":
+    main()
+                
