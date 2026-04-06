@@ -15,6 +15,7 @@ INA219_ADDR = 0x40
 RELAY_PIN = None # Change it when we know it
 RELAY_ON = 1
 RELAY_OFF = 0
+BUTTON_PIN = None # Change it when we know it
 
 SAMPLE_INTERVAL = 30  # in seconds
 LEARNING_DAYS = 4 
@@ -25,8 +26,10 @@ ON_THRESHOLD = 5.0  # in watts, adjust as needed
 MAX_DAYS = 14
 
 SCHEDULE_FILE = "schedule.json"
-STATE_FILE = "state.json"
+CLOCK_FILE = "clock.json" # Stops it from overriding the schedule lol
 SAVE_TO_FLASH = 300 # Save to flash every 5 minutes (300 seconds)
+
+OVERRIDE_TIME = 30 * 60 # It will override the button 30 minutes after it's pushed
 
 # INA219 Drivers to read current and voltage
 class INA219:
@@ -82,28 +85,53 @@ class Relay:
             self.pin = machine.Pin(pin_num, machine.Pin.OUT)
             self.apply()  # Ensure relay starts in off state
 
-    def _apply(self):
+    def apply(self):
         if self.pin:
             self.pin.value(RELAY_ON if self.state else RELAY_OFF)
 
     def on(self):
         if not self.state:
             self.state = True
-            self._apply()
+            self.apply()
             print("[RELAY] ON")
 
     def off(self):
         if self.state:
             self.state = False
-            self._apply()
+            self.apply()
             print("[RELAY] OFF")
 
     def set(self, should_be_on):
         self.on() if should_be_on else self.off()
 
+class ManualOverride:
+    def __init__(self, button_pin):
+        self.active = False
+        self.override_state = False
+        self.start_time = 0
+        self._last_button = 1 # We will assume it's not pressed at all other times
+        if button_pin is not None:
+            self.button = machine.Pin(button_pin, machine.Pin.IN, machine.Pin.PULL_UP)
+        
+    def update(self, now_seconds, current_relay_state):
+        if self.button is not None:
+            btn = self.button.value()
+            if self._last_button == 1 and btn == 0: # Button pressed
+                self.override_state = not current_relay_state # Toggle the override state
+                self.active = True
+                self.start_time = now_seconds
+                print(f"[OVERRIDE] Button pressed. Override state: {'ON' if self.override_state else 'OFF'}")
+
+            else:
+                if self.active and (now_seconds - self.start_time) >= OVERRIDE_TIME:
+                    self.active = False
+                    print("[OVERRIDE] Override expired.")
+            
+            return self.active
+
 class Scheduler:
     def __init__(self):
-        self.slot = [[0,0,0] for _ in range(SCHEDULE_SLOTS)]  # Each slot: [total_power, count, average_power]
+        self.slot = [[0,0,] for _ in range(SCHEDULE_SLOTS)]  # Each slot: [total_power, count, average_power]
         self.active = [False] * SCHEDULE_SLOTS  # Whether the relay should be on in this slot
         self.days_recorded = 0
         self.locked = False
@@ -124,7 +152,7 @@ class Scheduler:
         self.slot[slot] = [on_count, total]
 
     def day_complete(self):
-        self.days_seen += 1
+        self.days_recorded += 1
         print(f"[SCHEDULER] Day complete. Total days recorded: {self.days_recorded}")
         if self.days_recorded >= LEARNING_DAYS:
             self.build()
@@ -158,7 +186,7 @@ class Scheduler:
             "days_recorded": self.days_recorded,
             "locked": self.locked
         }
-        with open(STATE_FILE, "w") as f:
+        with open(SCHEDULE_FILE, "w") as f:
             ujson.dump(data, f)
 
     def load(self):
@@ -197,12 +225,12 @@ class Clock:
         return self.elapased // (24 * 60 * 60)
     
     def save(self):
-        with open(STATE_FILE, "w") as f:
+        with open(SCHEDULE_FILE, "w") as f:
             ujson.dump({"elapsed": self.elapased}, f)
 
     def _load(self):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(SCHEDULE_FILE, "r") as f:
                 data = ujson.load(f)
                 self.elapased = data.get("elapsed", 0)
                 print(f"[CLOCK] Loaded elapsed time: {self.elapased} seconds")
@@ -220,6 +248,7 @@ def main():
     )
     ina219 = INA219(i2c)
     relay = Relay(RELAY_PIN)
+    override = ManualOverride(BUTTON_PIN)
 
     # Init states
     scheduler = Scheduler()
@@ -237,44 +266,43 @@ def main():
         clock.sample()
         now_seconds = clock.elapased
 
-        if (now_seconds - last_sample) >= SAMPLE_INTERVAL:
+        if override.update(now_seconds, relay.state):
+            relay.set(override.override_state)
+        elif (now_seconds - last_sample) >= SAMPLE_INTERVAL:
             last_sample = now_seconds
             try:
                 voltage, current, power = ina219.read()
                 is_on = power >= ON_THRESHOLD
                 slot = clock.slot
 
-                print(f"[SAMPLE] Day {clock.day:.2f}, Slot {clock.slot}, Power: {power:.2f}W, Relay: {'ON' if is_on else 'OFF'}")
-
-                scheduler.record_sample(slot, is_on)
+                scheduler.record_sample(clock.slot, is_on)
 
                 if scheduler.locked:
                     relay.set(scheduler.should_be_on(slot))
                 else:
-                    relay.on
+                    relay.on()
             
             except Exception as e:
-                print(f"[ERROR] Failed to read sensor or update relay: {e}")
-
+                print(f"[ERROR] Failed to read INA219: {e}")
+        
         current_day = clock.day
-        if current_day != last_day:
+        if current_day > last_day:
             last_day = current_day
 
             if not scheduler.locked:
-                scheduler.mark_day_complete()
+                scheduler.day_complete()
             elif current_day % 3 == 0:
-                scheduler.maybe_update()
+                scheduler.maybe_update() # Slowly update the schedule over time even in locked phase
 
         if (now_seconds - last_save) >= SAVE_TO_FLASH:
             last_save = now_seconds
             try:
                 clock.save()
                 scheduler.save()
-                print("[SYSTEM] State saved to flash.")
             except Exception as e:
                 print(f"[ERROR] Failed to save state: {e}")
-
-        utime.sleep(1)
+        
+        utime.sleep(1) # Sleep a bit to avoid busy loop
 
 if __name__ == "__main__":
     main()
