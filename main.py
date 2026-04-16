@@ -4,14 +4,9 @@ import machine
 import utime
 import ujson
 
+# CHANGE ALL THE PINS WHEN WE WIRE
 
-# Configuration and set up. Switch pin numbers as needed
-I2C_ID = 0
-I2C_SDA_PIN = 21
-I2C_SCL_PIN = 22
-I2C_FREQ = 400_000
-INA219_ADDR = 0x40
-
+PIR_PIN = None
 RELAY_PIN = None # Change it when we know it
 RELAY_ON = 1
 RELAY_OFF = 0
@@ -20,7 +15,7 @@ BUTTON_PIN = None # Change it when we know it
 SAMPLE_INTERVAL = 30  # in seconds
 LEARNING_DAYS = 4 
 SCHEDULE_SLOTS = 48 # 48 30 minute time slots (2 days or 1140 minutes)
-ON_THRESHOLD = 5.0  # in watts, adjust as needed
+MOTION_TIMEOUT = 45 * 60
 
 # It will keep two weeks worth of data before deleting the oldest slot
 MAX_DAYS = 14
@@ -32,50 +27,16 @@ SAVE_TO_FLASH = 300 # Save to flash every 5 minutes (300 seconds)
 OVERRIDE_TIME = 30 * 60 # It will override the button 30 minutes after it's pushed
 
 # INA219 Drivers to read current and voltage
-class INA219:
+class PIR:
+    def __init__(self, pin_num):
+        self.pin = None
+        if pin_num is not None:
+            self.pin = machine.Pin(pin_num, machine.Pin.IN)
 
-    # Comms adresses
-    REG_CONFIG = 0x00
-    # REG_SHUNT_VOLTAGE = 0x01
-    REG_BUS_VOLTAGE = 0x02  
-    # REG_POWER = 0x03
-    REG_CURRENT = 0x04
-    REG_CALIBRATION = 0x05
-
-    # Some of this might need to change depending on the shunt resistor and expected current range. This is for 1mA resolution and 0.1 ohm shunt resistor
-    CONFIG_DEFEAULT = 0x399F  # Default configuration for INA219
-    CALIB_VALUE = 4096  # Calibration value for 1mA resolution
-
-    def __init__(self, i2c, addr=INA219_ADDR):
-        self.i2c = i2c
-        self.addr = addr
-        self.write_reg(self.REG_CONFIG, self.CONFIG_DEFEAULT)
-        self.write_reg(self.REG_CALIBRATION, self.CALIB_VALUE)
-
-    def write_reg(self, reg, value):
-        self.i2c.writeto(self.addr, bytes([reg, (value >> 8) & 0xFF, value & 0xFF]))
-
-    def read_reg(self, reg):
-        self.i2c.writeto(self.addr, bytes([reg]))
-        data = self.i2c.readfrom(self.addr, 2) # Splits the byte into two
-        return (data[0] << 8) | data[1] # Reassembles them back into 16
-    
-    def bus_voltage(self):
-        raw = self.read_reg(self.REG_BUS_VOLTAGE)
-        return (raw >> 3) * 0.004  # Convert to volts, adjust if needed
-    
-    def current(self):
-        # Gives the curret in milliamps
-        raw = self.read_reg(self.REG_CURRENT)
-        if raw > 0x7FFF:  # Handle negative values for signed current
-            raw -= 0x10000
-        return raw * 0.001  # Convert to amps, adjust if needed
-    
-    def read(self):
-        voltage = self.bus_voltage()
-        current = self.current()
-        power = voltage * current
-        return voltage, current, power
+    def motion_detected(self):
+        if self.pin is None:
+            return False
+        return self.pin.value() == 1
     
 class Relay:
     def __init__(self, pin_num):
@@ -137,7 +98,7 @@ class Scheduler:
         self.locked = False
 
     # Recording a sample and rolling concurrent purge
-    def record_sample(self, slot, is_on):
+    def record_sample(self, slot, motion_seen):
         on_count, total = self.slot[slot]
 
         if total >= MAX_DAYS:
@@ -146,7 +107,7 @@ class Scheduler:
             total -= 1
 
         total += 1
-        if is_on:
+        if motion_seen:
             on_count += 1
 
         self.slot[slot] = [on_count, total]
@@ -168,7 +129,9 @@ class Scheduler:
         on_count = sum(self.active)
         print(f"[SCHEDULER] Schedule built. Active slots: {on_count}/{SCHEDULE_SLOTS}")
 
-    def should_be_on(self, slot):
+    def is_active_slot(self, slot):
+        if not self.locked:
+            return True
         return self.active[slot]
     
     def maybe_update(self):
@@ -240,13 +203,7 @@ class Clock:
 # Main loop starts HERE
 def main():
     # Init hardware
-    i2c = machine.I2C(
-        I2C_ID, 
-        scl=machine.Pin(I2C_SCL_PIN), 
-        sda=machine.Pin(I2C_SDA_PIN), 
-        freq=I2C_FREQ
-    )
-    ina219 = INA219(i2c)
+    pir = PIR(PIR_PIN)
     relay = Relay(RELAY_PIN)
     override = ManualOverride(BUTTON_PIN)
 
@@ -259,50 +216,54 @@ def main():
     last_save = clock.elapased
     last_day = clock.day
 
+    last_motion_time = 0
+    motion_this_window = False
+
     phase = "LOCKED" if scheduler.locked else "LEARNING"
     print(f"[SYSTEM] Starting in {phase} phase.")
 
     while True:
         clock.sample()
-        now_seconds = clock.elapased
+        now = clock.elapased
+        slot = clock.slot
 
-        if override.update(now_seconds, relay.state):
+        if pir.motion_detected():
+            if scheduler.is_active_slot(slot):
+
+                last_motion_time = now
+                motion_this_window = True
+
+        if override.update(now, relay.state):
             relay.set(override.override_state)
-        elif (now_seconds - last_sample) >= SAMPLE_INTERVAL:
-            last_sample = now_seconds
-            try:
-                voltage, current, power = ina219.read()
-                is_on = power >= ON_THRESHOLD
-                slot = clock.slot
 
-                scheduler.record_sample(clock.slot, is_on)
+        else:
+            if last_motion_time is not None and (now - last_motion_time) < MOTION_TIMEOUT:
+                relay.on()
+            else:
+                relay.off()
 
-                if scheduler.locked:
-                    relay.set(scheduler.should_be_on(slot))
-                else:
-                    relay.on()
-            
-            except Exception as e:
-                print(f"[ERROR] Failed to read INA219: {e}")
-        
+        if (now - last_sample) >= SAMPLE_INTERVAL:
+            scheduler.record_sample(slot, motion_this_window)
+            motion_this_window = False
+            last_sample = now
+
         current_day = clock.day
         if current_day > last_day:
             last_day = current_day
-
             if not scheduler.locked:
                 scheduler.day_complete()
             elif current_day % 3 == 0:
-                scheduler.maybe_update() # Slowly update the schedule over time even in locked phase
+                scheduler.maybe_update()
 
-        if (now_seconds - last_save) >= SAVE_TO_FLASH:
-            last_save = now_seconds
+        if (now - last_save) >= SAVE_TO_FLASH:
+            last_save = now
             try:
                 clock.save()
                 scheduler.save()
             except Exception as e:
                 print(f"[ERROR] Failed to save state: {e}")
-        
-        utime.sleep(1) # Sleep a bit to avoid busy loop
+
+        utime.sleep(1)
 
 if __name__ == "__main__":
     main()
