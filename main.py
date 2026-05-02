@@ -71,10 +71,15 @@ class ManualOverride:
         self.override_state = False
         self.start_time = 0
         self._last_button = 1 # We will assume it's not pressed at all other times
+
+        self.button = None
         if button_pin is not None:
             self.button = machine.Pin(button_pin, machine.Pin.IN, machine.Pin.PULL_UP)
         
     def update(self, now_seconds, current_relay_state):
+        if self.button is None:
+            return False
+
         if self.button is not None:
             btn = self.button.value()
             if self._last_button == 1 and btn == 0: # Button pressed
@@ -156,7 +161,7 @@ class Scheduler:
         try:
             with open(SCHEDULE_FILE, "r") as f:
                 data = ujson.load(f)
-            self.slot_votes = data["votes"]
+            self.slot = data["votes"]
             self.active = data["active"]
             self.days_recorded = data["days_recorded"]
             self.locked = data["locked"]
@@ -188,12 +193,12 @@ class Clock:
         return self.elapased // (24 * 60 * 60)
     
     def save(self):
-        with open(SCHEDULE_FILE, "w") as f:
+        with open(CLOCK_FILE, "w") as f:
             ujson.dump({"elapsed": self.elapased}, f)
 
     def _load(self):
         try:
-            with open(SCHEDULE_FILE, "r") as f:
+            with open(CLOCK_FILE, "r") as f:
                 data = ujson.load(f)
                 self.elapased = data.get("elapsed", 0)
                 print(f"[CLOCK] Loaded elapsed time: {self.elapased} seconds")
